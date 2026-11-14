@@ -3840,7 +3840,12 @@ class MaintNotificationsAbstractConnectionPool:
     ):
         """Update the maintenance notifications config for all connections in the pool."""
         cached_connections = []
-        with self._get_pool_lock():
+        with (
+            self._defer_cached_disconnects()
+            if self.cache is not None
+            else nullcontext(),
+            self._get_pool_lock(),
+        ):
             for conn in self._get_free_connections():
                 if oss_cluster_maint_notifications_handler:
                     # set cluster handler for conn
@@ -4130,6 +4135,9 @@ class MaintNotificationsAbstractConnectionPool:
                             )
                         cached = isinstance(conn, CacheProxyConnection)
                         if cached and not conn._try_acquire_idle():
+                            # Blocking release can publish its slot after its
+                            # reconnect check but before dropping ownership.
+                            conn._disconnect_on_checkout = True
                             conn.mark_for_reconnect()
                             continue
                         try:
@@ -4563,7 +4571,12 @@ class ConnectionPool(MaintNotificationsAbstractConnectionPool, ConnectionPoolInt
         self._checkpid()
         is_created = False
 
-        with self._lock:
+        with (
+            self._defer_cached_disconnects()
+            if self.cache is not None
+            else nullcontext(),
+            self._lock,
+        ):
             try:
                 connection = self._available_connections.pop()
             except IndexError:
@@ -5203,12 +5216,13 @@ class BlockingConnectionPool(ConnectionPool):
 
     def make_connection(self):
         "Make a fresh connection."
-        locked = False
-        try:
-            if self._in_maintenance:
-                self._lock.acquire()
-                locked = True
-
+        locked = self._in_maintenance
+        with (
+            self._defer_cached_disconnects()
+            if locked and self.cache is not None
+            else nullcontext(),
+            self._lock if locked else nullcontext(),
+        ):
             if self.cache is not None:
                 connection = CacheProxyConnection(
                     self.connection_class(**self.connection_kwargs),
@@ -5220,9 +5234,6 @@ class BlockingConnectionPool(ConnectionPool):
             self._connections.append(connection)
 
             return connection
-        finally:
-            if locked:
-                self._lock.release()
 
     @deprecated_args(
         args_to_warn=["*"],

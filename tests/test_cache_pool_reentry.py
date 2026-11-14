@@ -16,6 +16,7 @@ from redis.connection import BlockingConnectionPool, ConnectionPool
 from redis.event import AfterConnectionReleasedEvent
 from redis.maint_notifications import (
     MaintNotificationsConfig,
+    MaintNotificationsConnectionHandler,
     NodeMovingNotification,
     OSSMaintNotificationsHandler,
     OSSNodeMigratedNotification,
@@ -42,6 +43,67 @@ PARSERS = [
         marks=pytest.mark.skipif(not HIREDIS_AVAILABLE, reason="requires hiredis"),
     ),
 ]
+
+
+@pytest.mark.parametrize("parser_class", PARSERS)
+def test_moving_retires_connection_published_by_blocking_release(request, parser_class):
+    pool = BlockingConnectionPool.from_url(
+        request.config.getoption("--redis-url"),
+        protocol=3,
+        parser_class=parser_class,
+        cache_config=CacheConfig(),
+        max_connections=1,
+        socket_timeout=1,
+        maint_notifications_config=MaintNotificationsConfig(enabled="auto"),
+    )
+    owner = pool.get_connection()
+    owner.send_command("CLIENT", "ID")
+    previous_id = owner.read_response()
+    published, finish_release = threading.Event(), threading.Event()
+    original_put = pool.pool.put_nowait
+    errors = []
+
+    def put(connection):
+        original_put(connection)
+        published.set()
+        assert finish_release.wait(5), "MOVING handler did not finish"
+
+    def release():
+        try:
+            pool.release(owner)
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=release, daemon=True)
+    handler = pool._maint_notifications_pool_handler
+    moved_host = "127.0.0.1" if owner.host == "localhost" else "localhost"
+    checked_out = None
+    try:
+        with patch.object(pool.pool, "put_nowait", put):
+            worker.start()
+            assert published.wait(3)
+            assert owner._in_use_lock.locked() and not owner.should_reconnect()
+            with patch.object(handler, "_schedule"):
+                handler.handle_notification(
+                    NodeMovingNotification(1, moved_host, owner.port, 60)
+                )
+            assert owner.host == moved_host
+            assert owner.is_connected, "MOVING disconnected the releasing owner"
+            finish_release.set()
+            worker.join(3)
+            assert not worker.is_alive() and not errors, errors
+        checked_out = pool.get_connection()
+        checked_out.send_command("CLIENT", "ID")
+        assert checked_out.read_response() != previous_id
+        checked_out.send_command("PING")
+        assert checked_out.read_response() == b"PONG"
+    finally:
+        finish_release.set()
+        worker.join(5)
+        if checked_out is not None:
+            pool.release(checked_out)
+        handler.cancel_scheduled_tasks()
+        pool.close()
 
 
 def _run_bounded(target, args):
@@ -270,7 +332,7 @@ def _finalizer_during_pool_lock(
         db=address.get("db", 0),
         parser_class=parser_class,
         cache_config=CacheConfig(),
-        max_connections=2,
+        max_connections=3 if operation == "checkout" else 2,
         socket_timeout=1,
         maint_notifications_config=MaintNotificationsConfig(
             enabled="auto" if proactive else False
@@ -306,6 +368,10 @@ def _finalizer_during_pool_lock(
     original_poll = owner._conn.can_read
     original_disconnect = released._conn.disconnect
     collected = False
+    reserved, resume_checkout = threading.Event(), threading.Event()
+    checked_out = []
+    original_acquire = owner._acquire
+    connection_class = pool.connection_class
     enabled, thresholds = gc.isenabled(), gc.get_threshold()
     gc.disable()
     victim = Redis.from_pool(pool)
@@ -360,12 +426,36 @@ def _finalizer_during_pool_lock(
             collect()
         return chain(*args)
 
+    def configure(*args, **kwargs):
+        if operation == "maintenance_config":
+            collect()
+        return MaintNotificationsConnectionHandler(*args, **kwargs)
+
+    def create(*args, **kwargs):
+        if operation == "checkout":
+            collect()
+        return connection_class(*args, **kwargs)
+
+    def acquire():
+        reserved.set()
+        assert resume_checkout.wait(5), "new connection was not created"
+        original_acquire()
+
+    def checkout():
+        try:
+            checked_out.append(pool.get_connection())
+        except BaseException as error:
+            errors.append(error)
+
     reader = threading.Thread(target=read, daemon=True)
+    waiter = threading.Thread(target=checkout, daemon=True)
     try:
         with (
             patch.object(owner._conn, "can_read", poll),
             patch.object(released._conn, "disconnect", disconnect),
             patch("redis.connection.chain", snapshot),
+            patch("redis.connection.MaintNotificationsConnectionHandler", configure),
+            patch.object(pool, "connection_class", create),
         ):
             reader.start()
             assert draining.wait(3), "peer did not start draining the idle owner"
@@ -379,6 +469,29 @@ def _finalizer_during_pool_lock(
                 assert pool._created_connections == 1
             elif operation == "topology_cleanup":
                 NodesManager._free_pool_connections(pool)
+            elif operation == "maintenance_config":
+                pool.update_maint_notifications_config(
+                    MaintNotificationsConfig(enabled="auto")
+                )
+            elif operation == "checkout":
+                # Reserve the draining owner without using its socket. The
+                # next checkout must allocate a new connection under the lock.
+                with patch.object(owner, "_acquire", acquire):
+                    waiter.start()
+                    assert reserved.wait(3)
+                    if isinstance(pool, BlockingConnectionPool):
+                        pool.set_in_maintenance(True)
+                    fresh = pool.get_connection()
+                    if isinstance(pool, BlockingConnectionPool):
+                        pool.set_in_maintenance(False)
+                    resume_checkout.set()
+                    waiter.join(3)
+                    assert not waiter.is_alive() and not errors, errors
+                for connection in [fresh, *checked_out]:
+                    connection.send_command("PING")
+                    assert connection.read_response() == b"PONG"
+                    pool.release(connection)
+                pool.release(released)
             elif operation in ("multidb", "multidb_cluster"):
                 client = Redis(connection_pool=pool)
                 old_database = Mock(client=client)
@@ -440,7 +553,8 @@ def _finalizer_during_pool_lock(
         if reconnect_handler is not None:
             reconnect_handler.cancel_scheduled_tasks()
         assert collected
-        assert not owner.is_connected
+        if operation != "checkout":
+            assert not owner.is_connected
         assert not released.is_connected
         assert not owner._in_use_lock.locked()
         assert not owner._idle_maintenance
@@ -449,6 +563,9 @@ def _finalizer_during_pool_lock(
         assert reused.read_response() == b"PONG"
         pool.release(reused)
     finally:
+        resume_checkout.set()
+        if waiter.ident is not None:
+            waiter.join(5)
         gc.set_threshold(*thresholds)
         if enabled:
             gc.enable()
@@ -459,6 +576,25 @@ def _finalizer_during_pool_lock(
         pool.close()
         writer.delete(key)
         writer.close()
+
+
+@pytest.mark.parametrize("pool_class", [ConnectionPool, BlockingConnectionPool])
+@pytest.mark.parametrize("parser_class", PARSERS)
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("operation", ["maintenance_config", "checkout"])
+def test_finalizer_during_pool_configuration_and_checkout(
+    request, pool_class, parser_class, automatic, operation
+):
+    _run_bounded(
+        _finalizer_during_pool_lock,
+        (
+            request.config.getoption("--redis-url"),
+            parser_class,
+            automatic,
+            operation,
+            pool_class,
+        ),
+    )
 
 
 @pytest.mark.parametrize("parser_class", PARSERS)
